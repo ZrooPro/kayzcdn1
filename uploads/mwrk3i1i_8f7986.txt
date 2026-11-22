@@ -1,0 +1,257 @@
+import { readFile } from 'node:fs/promises'
+
+// V7: inline animated dashboard + a native WhatsApp category picker.
+export const DASHBOARD_GROUPS = [
+  { number: 1, section: 0, title: '⚙️ UMUM & SISTEM', description: 'Informasi bot, bantuan, dan pengaturan dasar', tags: ['main', 'info', 'general'] },
+  { number: 2, section: 0, title: '📥 DOWNLOAD CENTER', description: 'Unduh media dari platform populer', tags: ['downloader', 'download'] },
+  { number: 3, section: 0, title: '🎬 MEDIA & CONVERTER', description: 'Audio, video, dokumen, dan konversi format', tags: ['converter', 'convert', 'media', 'audio', 'video'] },
+  { number: 4, section: 0, title: '🌐 SEARCH & INTERNET', description: 'Pencarian, berita, dan penelusuran profil', tags: ['search', 'internet', 'stalker', 'stalk', 'news'] },
+  { number: 5, section: 0, title: '🎨 IMAGE & CREATIVE', description: 'Edit foto, desain, dan generator visual', tags: ['maker', 'image', 'images', 'photo', 'edit', 'am'] },
+  { number: 6, section: 0, title: '✨ AI STUDIO', description: 'Asisten AI dan alat produktivitas pintar', tags: ['ai', 'openai', 'chatgpt'] },
+  { number: 7, section: 1, title: '👥 GROUP ESSENTIALS', description: 'Fitur komunitas dan pengelolaan grup', tags: ['group', 'grup'] },
+  { number: 8, section: 1, title: '🎲 FUN & MINI GAMES', description: 'Hiburan ringan dan permainan berbasis chat', tags: ['game', 'games', 'fun', 'random', 'freefire', 'mlbb', 'samp', 'primbon'] },
+  { number: 9, section: 1, title: '🕌 MUSLIM CENTER', description: 'Al-Quran, jadwal ibadah, dan fitur Islami', tags: ['islami', 'islam', 'muslim'] },
+  { number: 10, section: 1, title: '🪄 STICKER & MEDIA', description: 'Stiker, watermark, dan kreasi media', tags: ['sticker', 'stiker'] },
+  { number: 11, section: 1, title: '🎞️ ANIME & HIBURAN', description: 'Anime, donghua, manga, dan bacaan', tags: ['anime', 'donghua', 'manga', 'komik', 'movie', 'film', 'alkitab'] },
+  { number: 12, section: 2, title: '🛍️ STORE & PANEL', description: 'Katalog, transaksi, dan pengelolaan panel', tags: ['store', 'panel', 'shop'] },
+  { number: 13, section: 2, title: '👑 OWNER & UTILITY', description: 'Kontrol owner, alat bantu, dan kategori lainnya', tags: ['owner', 'tools', 'tool', 'utility'] }
+]
+
+const SECTION_TITLES = ['「 ESSENTIAL & CREATIVE 」', '「 COMMUNITY & ENTERTAINMENT 」', '「 BUSINESS & CONTROL 」']
+const weatherCache = new Map()
+let cachedBanner = null
+const clean = value => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').trim()
+const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch])
+const scriptJson = value => JSON.stringify(value).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')
+
+function pluginHelp(plugin) {
+  const list = typeof plugin.help === 'string' ? [plugin.help] : Array.isArray(plugin.help) ? plugin.help : []
+  const help = list.filter(value => typeof value === 'string' && value.trim()).map(value => value.trim())
+  if (help.length) return help
+  if (typeof plugin.command === 'string') return [plugin.command]
+  if (Array.isArray(plugin.command)) return plugin.command.filter(value => typeof value === 'string')
+  return []
+}
+
+function pluginTags(plugin) {
+  const tags = Array.isArray(plugin.tags) ? plugin.tags : typeof plugin.tags === 'string' ? [plugin.tags] : []
+  return tags.map(tag => clean(tag).toLowerCase()).filter(Boolean)
+}
+
+export function dashboardRegistry(plugins = []) {
+  const active = plugins.filter(plugin => plugin && !plugin.disabled)
+  const allTags = new Set(active.flatMap(pluginTags))
+  const knownTags = new Set(DASHBOARD_GROUPS.flatMap(group => group.tags))
+  const otherTags = [...allTags].filter(tag => !knownTags.has(tag)).sort()
+  const groups = DASHBOARD_GROUPS.map(group => {
+    const availableTags = [...group.tags, ...(group.number === 13 ? otherTags : [])].filter(tag => allTags.has(tag))
+    const commands = new Set()
+    active.forEach(plugin => {
+      if (pluginTags(plugin).some(tag => availableTags.includes(tag))) pluginHelp(plugin).forEach(help => commands.add(help))
+    })
+    return { ...group, tags: availableTags, count: commands.size }
+  })
+  return { groups, totalCommands: new Set(active.flatMap(pluginHelp)).size, totalPlugins: active.length }
+}
+
+export function dashboardShortcut(command, text, plugins) {
+  const match = /^menu(1[0-3]|[1-9])$/i.exec(command || '')
+  if (!match) return text || ''
+  const group = dashboardRegistry(plugins).groups.find(item => item.number === Number(match[1]))
+  // An absent category uses its configured tags so it returns the normal "not found" message.
+  return (group?.tags.length ? group.tags : DASHBOARD_GROUPS[Number(match[1]) - 1].tags).join(',')
+}
+
+export function dashboardPicker(registry, prefix = '.') {
+  return SECTION_TITLES.map((title, index) => ({
+    title,
+    rows: registry.groups.filter(group => group.section === index && group.count > 0).map(group => ({
+      title: group.title,
+      description: group.description + ' · ' + group.count + ' cmd',
+      id: prefix + 'menu' + group.number
+    }))
+  })).filter(section => section.rows.length)
+}
+
+export async function dashboardDeadline(task, milliseconds, stage) {
+  let timer
+  try {
+    return await Promise.race([task, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(stage + ' timeout')), milliseconds)
+    })])
+  } finally { clearTimeout(timer) }
+}
+
+function weatherDescription(code) {
+  if (code === 0) return 'Cerah ☀️'
+  if (code === 1) return 'Cerah berawan 🌤️'
+  if (code === 2) return 'Berawan sebagian 🌤️'
+  if (code === 3) return 'Berawan ☁️'
+  if ([45, 48].includes(code)) return 'Berkabut 🌫️'
+  if ([51, 53, 55, 56, 57].includes(code)) return 'Gerimis 🌦️'
+  if ([61, 63, 65, 66, 67, 80, 81, 82].includes(code)) return 'Hujan 🌧️'
+  if ([71, 73, 75, 77, 85, 86].includes(code)) return 'Salju ❄️'
+  if ([95, 96, 97, 99].includes(code)) return 'Hujan petir ⛈️'
+  return 'Kondisi cuaca'
+}
+
+export async function dashboardWeather(city = 'Bandung', { fetchImpl = fetch, timeout = 3500 } = {}) {
+  city = clean(city).slice(0, 80) || 'Bandung'
+  const key = city.toLowerCase()
+  const cached = weatherCache.get(key)
+  if (cached && cached.expires > Date.now()) return cached.value
+  const missing = { city, text: 'Cuaca belum tersedia', available: false }
+  try {
+    const signal = AbortSignal.timeout(timeout)
+    const value = await dashboardDeadline((async () => {
+      const locationUrl = new URL('https://geocoding-api.open-meteo.com/v1/search')
+      locationUrl.searchParams.set('name', city)
+      locationUrl.searchParams.set('count', '1')
+      locationUrl.searchParams.set('language', 'id')
+      locationUrl.searchParams.set('countryCode', 'ID')
+      const locationResponse = await fetchImpl(locationUrl, { signal })
+      if (!locationResponse.ok) throw new Error('Location unavailable')
+      const location = (await locationResponse.json()).results?.[0]
+      if (!Number.isFinite(location?.latitude) || !Number.isFinite(location?.longitude)) throw new Error('City not found')
+      const weatherUrl = new URL('https://api.open-meteo.com/v1/forecast')
+      weatherUrl.searchParams.set('latitude', String(location.latitude))
+      weatherUrl.searchParams.set('longitude', String(location.longitude))
+      weatherUrl.searchParams.set('current', 'temperature_2m,weather_code')
+      weatherUrl.searchParams.set('timezone', 'Asia/Jakarta')
+      const weatherResponse = await fetchImpl(weatherUrl, { signal })
+      if (!weatherResponse.ok) throw new Error('Weather unavailable')
+      const current = (await weatherResponse.json()).current
+      if (!Number.isFinite(current?.temperature_2m) || !Number.isFinite(current?.weather_code)) throw new Error('Weather incomplete')
+      return { city: clean(location.name || city), text: weatherDescription(current.weather_code) + ' ' + Math.round(current.temperature_2m) + '°C', available: true }
+    })(), timeout, 'Weather')
+    weatherCache.set(key, { value, expires: Date.now() + 600000 })
+    while (weatherCache.size > 8) weatherCache.delete(weatherCache.keys().next().value)
+    return value
+  } catch {
+    weatherCache.set(key, { value: missing, expires: Date.now() + 60000 })
+    return missing
+  }
+}
+
+async function dashboardBanner() {
+  if (cachedBanner !== null) return cachedBanner
+  for (const file of ['menu-v7-banner.gif', 'thumbnail.jpg', 'banner.jpg']) {
+    try {
+      const bytes = await readFile(new URL('../media/' + file, import.meta.url))
+      if (bytes.length > 250000) continue
+      const type = file.endsWith('.gif') ? 'image/gif' : 'image/jpeg'
+      cachedBanner = 'data:' + type + ';base64,' + bytes.toString('base64')
+      return cachedBanner
+    } catch {}
+  }
+  return ''
+}
+
+function dashboardTips(plugins, prefix) {
+  const help = new Set(plugins.filter(plugin => !pluginTags(plugin).includes('owner')).flatMap(pluginHelp))
+  const tips = []
+  for (const keyword of ['play', 'igstalkcard', 'brat', 'sticker', 'ping', 'owner']) {
+    const example = [...help].find(item => item.split(/\s+/)[0].toLowerCase() === keyword)
+    if (example) tips.push('💡 Coba ' + prefix + example)
+  }
+  tips.push('📂 Pilih kategori lewat tombol BUKA MENU.')
+  tips.push('✨ Ketik ' + prefix + 'menu all untuk melihat semua perintah.')
+  return tips
+}
+
+export function dashboardHtml(data) {
+  const e = escapeHtml
+  const weather = data.weather || { city: 'Bandung', text: 'Cuaca belum tersedia', available: false }
+  const banner = /^data:image\/(?:gif|jpeg|png|webp);base64,[a-zA-Z0-9+/=]+$/.test(data.banner || '') ? '<img src="' + data.banner + '" alt="Banner animasi">' : ''
+  const initialTime = new Date(data.generatedAt).toLocaleTimeString('en-GB', { timeZone: 'Asia/Jakarta' })
+  const initialDate = new Date(data.generatedAt).toLocaleDateString('id-ID', { timeZone: 'Asia/Jakarta', weekday: 'long', day: 'numeric', month: 'short', year: 'numeric' })
+  const tips = data.tips?.length ? data.tips : ['📂 Pilih kategori lewat tombol BUKA MENU.']
+  const payload = scriptJson({ generatedAt: data.generatedAt, uptime: data.uptime, tips })
+  return '<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>' +
+    '*{box-sizing:border-box}html,body{height:560px;margin:0;overflow:hidden;font-family:system-ui,-apple-system,Arial,sans-serif;color:#e7edf1;background:transparent}' +
+    '.app{height:560px;border:1px solid #243039;border-radius:20px;overflow:hidden;background:#0b151b;box-shadow:0 10px 28px #0003}' +
+    '.hero{height:150px;position:relative;overflow:hidden;background:radial-gradient(ellipse at 50% 60%,#163f43,#081116 70%)}.hero img{height:150px;width:100%;object-fit:cover;display:block}' +
+    '.glow{position:absolute;width:140px;height:140px;border:1px solid #22d3ba66;border-radius:50%;left:calc(50% - 70px);top:5px;box-shadow:0 0 55px #1ab39d40,inset 0 0 35px #1ab39d30;animation:pulse 4s ease-in-out infinite}.hero img+.glow{display:none}' +
+    '.heroLabel{position:absolute;left:14px;bottom:12px;letter-spacing:2px;font-size:9px;color:#99ffe4;text-shadow:0 2px 6px #000}.hero img~.heroLabel{display:none}' +
+    '.content{height:410px;padding:14px 14px 12px;display:grid;grid-template-rows:auto 112px 44px 46px 36px auto;gap:8px;align-content:start;min-width:0}' +
+    'h1{font-size:19px;line-height:23px;margin:0;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}h1 i{font-style:normal;color:#20d9bc}.greet{margin:5px 0 2px;color:#b6c1c8;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+    '.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.stat,.weather,.tip{background:#101c23;border:1px solid #26353e;border-radius:14px;min-width:0}.stat{height:52px;padding:9px 11px}' +
+    '.label{font-size:8px;line-height:12px;letter-spacing:1.2px;color:#8b9ba5;text-transform:uppercase}.value{font-size:13px;line-height:20px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.weather{height:44px;padding:6px 11px}.weather .value{font-size:12px;line-height:18px}' +
+    '.clock{height:46px;padding:9px 11px;display:flex;align-items:center;justify-content:space-between;gap:8px;background:linear-gradient(100deg,#0b302f,#0b191e);border:1px solid #19574e;border-radius:14px}' +
+    '.time{font-family:monospace;font-weight:800;font-size:19px;letter-spacing:.4px;color:#26dfc3;white-space:nowrap}.date{font-size:9px;color:#b1c6c8;text-align:right;max-width:130px}.tip{height:36px;padding:8px 10px;display:flex;gap:9px;align-items:center;font-size:10px;color:#c8d5dc}' +
+    '.dot{width:7px;height:7px;flex:none;background:#16dab9;border-radius:50%;box-shadow:0 0 12px #16dab9}.tipText{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.foot{font-size:9px;line-height:14px;text-align:center;color:#738690;padding-top:3px}.foot b{color:#20c8ab;font-weight:700}' +
+    '@keyframes pulse{50%{transform:scale(.9);opacity:.5}}@media(prefers-reduced-motion:reduce){.glow{animation:none}}@media(max-width:280px){.content{padding-left:10px;padding-right:10px}.time{font-size:16px}.date{font-size:8px}.value{font-size:12px}}' +
+    '</style></head><body><main class="app"><header class="hero">' + banner + '<span class="glow"></span><span class="heroLabel">YOUR BOT • YOUR CONTROL</span></header><section class="content">' +
+    '<div><h1>' + e(data.botName) + '<i>.</i></h1><p class="greet">👋 Halo, ' + e(data.userName) + '! Mau dibantu apa hari ini?</p></div>' +
+    '<div class="grid"><div class="stat"><div class="label">Status</div><div class="value">' + e(data.role) + '</div></div><div class="stat"><div class="label">Mode</div><div class="value">' + e(data.mode) + '</div></div>' +
+    '<div class="stat"><div class="label">Total Fitur</div><div class="value">' + e(data.totalCommands) + '</div></div><div class="stat"><div class="label">Runtime</div><div id="uptime" class="value">—</div></div></div>' +
+    '<div class="weather"><div class="label">Cuaca · ' + e(weather.city) + '</div><div class="value">📍 ' + e(weather.city) + ' • ' + e(weather.text) + '</div></div>' +
+    '<div class="clock"><span id="clock" class="time">' + e(initialTime) + '</span><span id="date" class="date">' + e(initialDate) + '</span></div>' +
+    '<div class="tip"><span class="dot"></span><span id="tip" class="tipText">' + e(tips[0]) + '</span></div>' +
+    '<footer class="foot">Tap <b>✦ BUKA MENU</b> di pesan berikutnya<br>Atau ketik ' + e(data.prefix) + 'menu1 – ' + e(data.prefix) + 'menu13' + (weather.available ? '<br>Cuaca: Open-Meteo' : '') + '</footer></section></main>' +
+    '<script>var dashboardData=' + payload + ',dashboardTimer=null,dashboardTip=0,dashboardTicks=0;' +
+    'function dashboardRuntime(seconds){seconds=Math.max(0,Math.floor(seconds));var hours=Math.floor(seconds/3600),minutes=Math.floor(seconds%3600/60),rest=seconds%60;return(hours?hours+"j ":"")+minutes+"m "+rest+"d"}' +
+    'function dashboardTick(){var now=new Date();document.getElementById("clock").textContent=now.toLocaleTimeString("en-GB",{timeZone:"Asia/Jakarta"});document.getElementById("date").textContent=now.toLocaleDateString("id-ID",{timeZone:"Asia/Jakarta",weekday:"long",day:"numeric",month:"short",year:"numeric"});document.getElementById("uptime").textContent=dashboardRuntime(dashboardData.uptime+Math.max(0,(Date.now()-dashboardData.generatedAt)/1000));if(++dashboardTicks%6===0){dashboardTip=(dashboardTip+1)%dashboardData.tips.length;document.getElementById("tip").textContent=dashboardData.tips[dashboardTip]}}' +
+    'function startDashboard(){if(dashboardTimer!==null)clearInterval(dashboardTimer);dashboardTick();dashboardTimer=setInterval(dashboardTick,1000)}document.addEventListener("visibilitychange",function(){if(document.hidden){if(dashboardTimer!==null)clearInterval(dashboardTimer);dashboardTimer=null}else startDashboard()});startDashboard();</script></body></html>'
+}
+
+export function dashboardRichContent(data) {
+  const responseId = 'jere-dashboard-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
+  const caption = '✨ *' + data.botName + '*\n👋 Halo, ' + data.userName + '!\n\nStatus: ' + data.role + '\nMode: ' + data.mode + '\nTotal fitur: ' + data.totalCommands + '\n\nTekan ✦ BUKA MENU di pesan berikutnya untuk memilih kategori.'
+  return {
+    messageContextInfo: { deviceListMetadata: {}, deviceListMetadataVersion: 2, botMetadata: { botResponseId: responseId } },
+    botForwardedMessage: { message: { richResponseMessage: {
+      messageType: 1,
+      submessages: [{ messageType: 2, messageText: caption }],
+      unifiedResponse: { data: Buffer.from(JSON.stringify({ response_id: responseId, sections: [{
+        __typename: 'GenAIUnifiedResponseSection',
+        view_model: { __typename: 'GenAISingleLayoutViewModel', primitive: { __typename: 'GenAIaeacdsnwHtmlPrimitive', payload: dashboardHtml(data), trusted_sources: [] } }
+      }] })) },
+      contextInfo: { isForwarded: true, forwardingScore: 1, forwardOrigin: 4 }
+    } } }
+  }
+}
+
+export async function sendDashboardMenu(m, conn, caption, options = {}) {
+  const prefix = options.usedPrefix || '.'
+  const plugins = options.plugins || []
+  const registry = dashboardRegistry(plugins)
+  const setting = global.db?.data?.settings?.[conn.user?.jid || conn.user?.id] || {}
+  const botName = clean(options.botInfo?.name || global.botname || 'Jere-MD').slice(0, 80)
+  const fallbackIndex = '📂 *' + botName + ' — KATEGORI MENU*\n\n' + registry.groups.filter(group => group.count > 0).map(group => prefix + 'menu' + group.number + ' • ' + group.title + ' (' + group.count + ' cmd)').join('\n')
+  if (!options.query) {
+    const status = clean(options.user?.status)
+    const data = {
+      botName, prefix,
+      userName: clean(options.user?.name || m.pushName || 'User').slice(0, 60),
+      role: options.isOwner || options.isROwner ? '👑 Owner' : /vip/i.test(status) ? '💎 VIP' : /premium/i.test(status) ? '⭐ Premium' : '👤 User',
+      mode: setting.gconly || global.opts?.gconly ? 'Group' : global.opts?.self || conn.public === false ? 'Self' : 'Public',
+      totalCommands: registry.totalCommands,
+      uptime: process.uptime(),
+      generatedAt: Date.now(),
+      weather: await dashboardWeather(setting.menuCity || global.menuCity || 'Bandung', { fetchImpl: options.fetchImpl || fetch, timeout: options.weatherTimeout || 3500 }),
+      banner: options.banner ?? await dashboardBanner(),
+      tips: dashboardTips(plugins, prefix)
+    }
+    try {
+      await dashboardDeadline((async () => {
+        const generate = options.generate || (await import('@adiwajshing/baileys')).generateWAMessageFromContent
+        const message = generate(m.chat, dashboardRichContent(data), { userJid: conn.user?.jid || conn.user?.id, quoted: m })
+        return conn.relayMessage(m.chat, message.message, { messageId: message.key.id })
+      })(), options.sendTimeout || 7000, 'Dashboard')
+    } catch {
+      await dashboardDeadline(m.reply('✨ *' + botName + '*\n👋 Halo, ' + data.userName + '!\nStatus: ' + data.role + ' • Mode: ' + data.mode + '\nTotal fitur: ' + data.totalCommands + '\n📍 ' + data.weather.city + ' • ' + data.weather.text), options.sendTimeout || 7000, 'Dashboard text').catch(() => {})
+    }
+  }
+  const sections = dashboardPicker(registry, prefix)
+  const body = options.query ? caption.replace(/\u200e/g, '') : '📂 *Pilih kategori, atau ketik ' + prefix + 'menu1 – ' + prefix + 'menu13*'
+  try {
+    await dashboardDeadline(conn.sendButton(m.chat, {
+      caption: body,
+      footer: botName + ' • Explore your commands',
+      buttons: [{ name: 'single_select', buttonParamsJson: JSON.stringify({ title: '✦ BUKA MENU', sections }) }]
+    }, { quoted: m }), options.sendTimeout || 7000, 'Category picker')
+  } catch {
+    await dashboardDeadline(m.reply(options.query ? body + '\n\n' + fallbackIndex : fallbackIndex), options.sendTimeout || 7000, 'Category text')
+  }
+}
